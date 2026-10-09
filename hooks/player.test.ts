@@ -131,6 +131,8 @@ test('downloads exec yt-dlp into a pipe, so killing the child kills the download
   expect(argv[2]!.startsWith('exec yt-dlp ')).toBe(true)
   expect(argv[2]).toContain('-o - > "$2"')
   expect(argv.slice(3)).toEqual(['/t/i.json', '251-20', '/t/audio.pipe'])
+  // Short requests: a long one sits idle behind the real-time reader until YouTube drops it.
+  expect(argv[2]).toContain('--http-chunk-size 1M')
 })
 
 test('decodeSize keeps the video shape, ~270 tall, at most 480 wide, even', () => {

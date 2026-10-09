@@ -79,8 +79,10 @@ export function parseFormats(stdout: string): Formats | undefined {
 
 // yt-dlp's own downloader into a named pipe. `exec` makes the shell become yt-dlp, so killing the
 // spawned process kills the download, with nothing left behind.
+// 1 MB requests: ffmpeg reads in real time, so a big request (yt-dlp's 10 MB is ~10 min of
+// audio) idles in the socket buffer until YouTube closes it and the sound stops for good.
 export function downloadArgv(infoPath: string, formatId: string, pipe: string): string[] {
-  return ['/bin/sh', '-c', 'exec yt-dlp -q --no-warnings --no-part --load-info-json "$0" -f "$1" -o - > "$2"',
+  return ['/bin/sh', '-c', 'exec yt-dlp -q --no-warnings --no-part --http-chunk-size 1M --load-info-json "$0" -f "$1" -o - > "$2"',
     infoPath, formatId, pipe]
 }
 
