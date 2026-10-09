@@ -63,7 +63,7 @@ export function detailsArgv(infoPath: string): string[] {
   return ['yt-dlp', '--no-warnings', '--load-info-json', infoPath, '-f', FORMAT,
     '--print', '%(requested_formats.0.format_id,format_id)s',
     '--print', '%(requested_formats.1.format_id,format_id)s',
-    '--print', '%(.{width,height,channel,view_count,like_count,upload_date,duration_string,description})j']
+    '--print', '%(.{width,height,channel,view_count,like_count,upload_date,duration,duration_string,description})j']
 }
 
 export type Formats = { video: string; audio: string; muxed: boolean }
@@ -92,9 +92,11 @@ export function decodeSize(aspect: number): FrameSize {
 
 // ffmpeg paces both inputs in real time (-re): frames go to one overwritten raw rgb24 file,
 // sound goes as raw PCM into the pipe ffplay reads. One process, one clock.
-export function decoderArgv(videoPipe: string, audioPipe: string | undefined, size: FrameSize, framePath: string, pcmPipe: string): string[] {
+// startAt > 0 starts there: ffmpeg reads and drops what comes before at full speed, unpaced.
+export function decoderArgv(videoPipe: string, audioPipe: string | undefined, size: FrameSize, framePath: string, pcmPipe: string, startAt = 0): string[] {
+  const ss = startAt > 0 ? ['-ss', startAt.toFixed(1)] : []
   return ['ffmpeg', '-v', 'error', '-nostdin',
-    '-re', '-i', videoPipe, ...(audioPipe ? ['-re', '-i', audioPipe] : []),
+    ...ss, '-re', '-i', videoPipe, ...(audioPipe ? [...ss, '-re', '-i', audioPipe] : []),
     '-map', '0:v:0', '-vf', `fps=${FPS},scale=${size.width}:${size.height}:flags=area`,
     '-pix_fmt', 'rgb24', '-c:v', 'rawvideo', '-f', 'image2', '-update', '1', '-atomic_writing', '1', framePath,
     '-map', audioPipe ? '1:a:0' : '0:a:0', '-ar', '48000', '-ac', '2', '-f', 's16le', '-y', pcmPipe]
@@ -111,6 +113,8 @@ export function soundArgv(pcmPipe: string): string[] {
 export type Meta = {
   width: number; height: number; channel: string; views?: number; likes?: number
   date: string; duration: string; description: string
+  /** Length in seconds; undefined for live streams. */
+  seconds?: number
 }
 
 // The JSON line yt-dlp prints after the stream URLs. Missing or broken → undefined.
@@ -126,7 +130,7 @@ export function parseMeta(stdout: string): Meta | undefined {
       width: num(j.width) ?? 16, height: num(j.height) ?? 9, channel: str(j.channel),
       views: num(j.view_count), likes: num(j.like_count),
       date: /^\d{8}$/.test(d) ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : '',
-      duration: str(j.duration_string), description: str(j.description),
+      duration: str(j.duration_string), description: str(j.description), seconds: num(j.duration),
     }
   } catch {
     return undefined
@@ -147,6 +151,21 @@ export function fitBox(aspect: number, cols: number, rows: number): { cols: numb
 export function linksIn(text: string, max = 20): string[] {
   const found = (text.match(/https?:\/\/[^\s<>"')\]]+/g) ?? []).map(u => u.replace(/[.,;:!?]+$/, ''))
   return [...new Set(found)].slice(0, max)
+}
+
+// Where a skip of `delta` seconds lands: never before the start, and short of the end
+// (a seek past the end would just finish the video).
+export function seekTarget(at: number, delta: number, seconds?: number): number {
+  const end = seconds !== undefined ? Math.max(0, seconds - 2) : Infinity
+  return Math.max(0, Math.min(at + delta, end))
+}
+
+// 75 → "1:15", 3725 → "1:02:05"
+export function clock(at: number): string {
+  const t = Math.max(0, Math.floor(at))
+  const [h, m, s] = [Math.floor(t / 3600), Math.floor(t / 60) % 60, t % 60]
+  const two = (n: number) => String(n).padStart(2, '0')
+  return h ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`
 }
 
 // 1234 → "1.2K", 3400000 → "3.4M"

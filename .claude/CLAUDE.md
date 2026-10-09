@@ -4,6 +4,10 @@ Claude Code mod: `/youtube <search or link>` plays YouTube inside a pane. Pure l
 
 ## Recent Changes
 
+### feat: pause, rewind and fast forward - 2026-10-09
+- Branch: `minor/3-pause-seek`
+- Summary: Playback runs in legs: pause ends the current leg's children and remembers the position; play and ±10 s skips start a new leg with `-ss` on each ffmpeg input (ffmpeg 9 drops pre-seek data unpaced). Per-leg pipe and frame names, a leg counter so a killed decoder is not a failure, position = offset + time since the leg's first frame. Keys j/k/l (YouTube's), only while the search bar is empty.
+
 ### feat: in-pane YouTube player with synced sound - 2026-10-07
 - Branch: `minor/1-in-pane-player`
 - PR: https://github.com/brogrammerMW/claude-youtube-mod/pull/2

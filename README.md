@@ -37,13 +37,16 @@ To load it in every session, add the folder to a local plugin marketplace and in
 
 | Key | Action |
 | --- | --- |
+| `k` | Pause / play |
+| `j` | Back 10 seconds |
+| `l` | Forward 10 seconds |
 | `s` | Stop |
 | `m` | Open in an mpv window |
 | `v` | Switch view: auto, pixels, blocks |
 | `Tab` | Move between the search bar, buttons and results |
 | `↑` `↓` | Scroll to the description and links |
 
-The `s`, `m` and `v` keys only work while the search bar is empty, so you can type searches freely.
+The `j`, `k`, `l`, `s`, `m` and `v` keys only work while the search bar is empty, so you can type searches freely.
 
 ## How it works
 
@@ -51,6 +54,8 @@ The `s`, `m` and `v` keys only work while the search bar is empty, so you can ty
 2. **Fetch.** yt-dlp downloads the video and audio itself into named pipes. YouTube refuses stream links that other programs open directly, so ffmpeg never opens one.
 3. **Decode.** A single ffmpeg reads both pipes at real-time speed. It writes frames to a file the pane draws, and sends the sound as raw audio through another pipe to ffplay.
 4. **Draw.** The pane scales one fixed-size frame to fit, so resizing or switching view restarts nothing.
+
+**Pause and skip.** Pausing ends the pipeline and remembers the spot. Play and skips start a new one there: ffmpeg drops everything before that spot as fast as the download allows, then plays in real time. A skip far into a long video waits for that much to download.
 
 If in-pane playback fails, the pane says why. mpv only opens when you press `window`.
 

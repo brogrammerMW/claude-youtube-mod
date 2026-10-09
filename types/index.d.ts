@@ -11,7 +11,9 @@ declare module 'claude-code' {
       mode: 'pixels' | 'blocks'
       /** User choice for the mode: auto picks from the terminal. */
       override: 'auto' | 'pixels' | 'blocks'
-      /** True while the player's search bar holds text: the s/m/v hotkeys are off then. */
+      /** True while playback is paused. */
+      paused: boolean
+      /** True while the player's search bar holds text: the j/k/l/s/m/v hotkeys are off then. */
       hasDraft: boolean
       /** Bumped on each player search submit, so the bar redraws empty. */
       submits: number
