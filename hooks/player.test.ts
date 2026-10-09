@@ -1,7 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import {
   blankCells, cellBox, clock, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, linksIn, lookupArgv,
-  nextOverride, parseFormats, parseMeta, pickMode, quadrantWords, resample, rgbToBlocks, seekTarget, soundArgv, videoIdFrom,
+  nextOverride, parseFormats, parseMeta, pickMode, quadrantWords, resample, rgbToBlocks, seekTarget, soundArgv, syncFilter, videoIdFrom,
 } from './player'
 
 test('pickMode: image terminals get pixels, the rest blocks, override wins', () => {
@@ -178,4 +178,12 @@ test('decoderArgv seeks each input only when starting past zero', () => {
   const argv = decoderArgv('v', 'a', size, 'f', 'p', 42)
   expect(argv.filter(x => x === '-ss').length).toBe(2)
   expect(argv.slice(argv.indexOf('-ss'), argv.indexOf('-ss') + 5)).toEqual(['-ss', '42.0', '-re', '-i', 'v'])
+})
+
+test('syncFilter pads to play later and trims to play earlier', () => {
+  expect(syncFilter(0)).toEqual([])
+  expect(syncFilter(150)).toEqual(['-af', 'adelay=150:all=1'])
+  expect(syncFilter(-100)).toEqual(['-af', 'atrim=start=0.100,asetpts=PTS-STARTPTS'])
+  const argv = decoderArgv('v', 'a', { width: 480, height: 270 }, 'f', 'p', 0, 150)
+  expect(argv.slice(argv.indexOf('1:a:0') + 1, argv.indexOf('1:a:0') + 3)).toEqual(['-af', 'adelay=150:all=1'])
 })

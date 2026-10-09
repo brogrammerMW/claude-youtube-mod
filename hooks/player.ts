@@ -93,13 +93,21 @@ export function decodeSize(aspect: number): FrameSize {
 // ffmpeg paces both inputs in real time (-re): frames go to one overwritten raw rgb24 file,
 // sound goes as raw PCM into the pipe ffplay reads. One process, one clock.
 // startAt > 0 starts there: ffmpeg reads and drops what comes before at full speed, unpaced.
-export function decoderArgv(videoPipe: string, audioPipe: string | undefined, size: FrameSize, framePath: string, pcmPipe: string, startAt = 0): string[] {
+// syncMs shifts the sound against the picture: later when positive, earlier when negative.
+export function decoderArgv(videoPipe: string, audioPipe: string | undefined, size: FrameSize, framePath: string, pcmPipe: string, startAt = 0, syncMs = 0): string[] {
   const ss = startAt > 0 ? ['-ss', startAt.toFixed(1)] : []
   return ['ffmpeg', '-v', 'error', '-nostdin',
     ...ss, '-re', '-i', videoPipe, ...(audioPipe ? [...ss, '-re', '-i', audioPipe] : []),
     '-map', '0:v:0', '-vf', `fps=${FPS},scale=${size.width}:${size.height}:flags=area`,
     '-pix_fmt', 'rgb24', '-c:v', 'rawvideo', '-f', 'image2', '-update', '1', '-atomic_writing', '1', framePath,
-    '-map', audioPipe ? '1:a:0' : '0:a:0', '-ar', '48000', '-ac', '2', '-f', 's16le', '-y', pcmPipe]
+    '-map', audioPipe ? '1:a:0' : '0:a:0', ...syncFilter(syncMs), '-ar', '48000', '-ac', '2', '-f', 's16le', '-y', pcmPipe]
+}
+
+// Later: pad silence in front. Earlier: drop the first bit, so every sample plays that much sooner.
+export function syncFilter(ms: number): string[] {
+  if (ms > 0) return ['-af', `adelay=${Math.round(ms)}:all=1`]
+  if (ms < 0) return ['-af', `atrim=start=${(-ms / 1000).toFixed(3)},asetpts=PTS-STARTPTS`]
+  return []
 }
 
 // ffplay plays the PCM with as little buffering as it allows; it ends when ffmpeg closes the pipe.

@@ -40,13 +40,14 @@ To load it in every session, add the folder to a local plugin marketplace and in
 | `k` | Pause / play |
 | `j` | Back 10 seconds |
 | `l` | Forward 10 seconds |
+| `[` `]` | Play the sound 50 ms earlier / later |
 | `s` | Stop |
 | `m` | Open in an mpv window |
 | `v` | Switch view: auto, pixels, blocks |
 | `Tab` | Move between the search bar, buttons and results |
 | `↑` `↓` | Scroll to the description and links |
 
-The `j`, `k`, `l`, `s`, `m` and `v` keys only work while the search bar is empty, so you can type searches freely.
+The `j`, `k`, `l`, `[`, `]`, `s`, `m` and `v` keys only work while the search bar is empty, so you can type searches freely.
 
 ## How it works
 

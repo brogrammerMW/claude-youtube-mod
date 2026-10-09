@@ -25,6 +25,10 @@ const submits = atom({ plugin: 'youtube', key: 'submits' } as const, 0)
 const override = atom({ plugin: 'youtube', key: 'override' } as const, 'auto' as Override)
 const paused = atom({ plugin: 'youtube', key: 'paused' } as const, false)
 const SKIP_SECONDS = 10
+// Image terminals draw each frame a little late, so the sound can run ahead; blocks need none.
+// ponytail: one session-wide offset, nudged by hand; save it per terminal if the right value differs.
+const syncMs = atom({ plugin: 'youtube', key: 'syncMs' } as const, 0)
+const SYNC_STEP_MS = 50
 
 export function parseResults(stdout: string): Video[] {
   return stdout
@@ -282,7 +286,8 @@ async function startLeg($: Engine, r: Run, at: number) {
   void child($, r, 'video download', downloadArgv(r.info, f.video, pipes.video))
   if (!f.muxed) void child($, r, 'audio download', downloadArgv(r.info, f.audio, pipes.audio))
   r.decoderAt = Date.now()
-  void watchDecoder($, r, leg, decoderArgv(pipes.video, f.muxed ? undefined : pipes.audio, r.size, r.framePath, pipes.pcm, at))
+  const sync = await read($, syncMs)
+  void watchDecoder($, r, leg, decoderArgv(pipes.video, f.muxed ? undefined : pipes.audio, r.size, r.framePath, pipes.pcm, at, sync))
 }
 
 const position = (r: Run) =>
@@ -313,6 +318,15 @@ async function skip($: Engine, delta: number) {
   await update($, status, () => `${delta < 0 ? '◀◀' : '▶▶'} ${clock(at)}${total(r)}${r.paused ? ' · paused' : ''}`)
   if (r.paused) r.offset = at
   else await startLeg($, r, at)
+}
+
+// Moves the sound against the picture and restarts from the current spot to apply it.
+async function nudgeSync($: Engine, deltaMs: number) {
+  const ms = (await read($, syncMs)) + deltaMs
+  await update($, syncMs, () => ms)
+  await update($, status, () => `audio ${ms > 0 ? '+' : ''}${ms} ms${ms > 0 ? ' (later)' : ms < 0 ? ' (earlier)' : ''}`)
+  const r = run
+  if (r?.formats && !r.paused) await startLeg($, r, position(r))
 }
 
 // The decoder's end is the leg's end: finished, or failed with the most telling error line.
@@ -526,6 +540,8 @@ export const register: Register = on => {
             <Button key="back" plain label={`◀◀ ${SKIP_SECONDS}s`} {...(keys ? { hotkey: 'j' } : {})} onPress={() => void skip($, -SKIP_SECONDS)} />
             <Button key="pause" plain label={isPaused ? 'play' : 'pause'} {...(keys ? { hotkey: 'k' } : {})} onPress={() => void togglePause($)} />
             <Button key="forward" plain label={`${SKIP_SECONDS}s ▶▶`} {...(keys ? { hotkey: 'l' } : {})} onPress={() => void skip($, SKIP_SECONDS)} />
+            <Button key="sync-earlier" plain label="audio −" {...(keys ? { hotkey: '[' } : {})} onPress={() => void nudgeSync($, -SYNC_STEP_MS)} />
+            <Button key="sync-later" plain label="audio +" {...(keys ? { hotkey: ']' } : {})} onPress={() => void nudgeSync($, SYNC_STEP_MS)} />
             <Button key="stop" plain label="stop" {...(keys ? { hotkey: 's' } : {})} onPress={() => void stopPlayback($, 'Stopped.')} />
             <Button key="window" plain label="window" {...(keys ? { hotkey: 'm' } : {})}
               onPress={() => { const r = run; if (r) void fallbackToMpv($, r, 'window requested') }} />
