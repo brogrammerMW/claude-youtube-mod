@@ -1,7 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import {
   blankCells, cellBox, clock, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, linksIn, lookupArgv,
-  nextOverride, parseFormats, parseMeta, pickMode, quadrantWords, resample, rgbToBlocks, seekTarget, soundArgv, videoIdFrom,
+  nextOverride, parseFormats, parseMeta, pickMode, quadrantWords, resample, rgbToBlocks, seekTarget, soundArgv, syncFilter, videoIdFrom,
 } from './player'
 
 test('pickMode: image terminals get pixels, the rest blocks, override wins', () => {
@@ -94,7 +94,9 @@ test('fitBox fills width or height with no bars', () => {
 
 test('parseMeta reads the details JSON line', () => {
   const out = '397\n251-20\n{"width":854,"height":480,"channel":"Chase AI","view_count":123456,"upload_date":"20260930","duration":551,"duration_string":"9:11","description":"see https://a.b/c."}'
-  const m = parseMeta(out)!
+  const m = parseMeta(out.replace('"width"', '"fps":24,"width"'))!
+  expect(m.fps).toBe(24)
+  expect(parseMeta(out)!.fps).toBe(undefined)
   expect([m.width, m.height, m.channel, m.views, m.date, m.duration, m.seconds]).toEqual([854, 480, 'Chase AI', 123456, '2026-09-30', '9:11', 551])
   expect(parseMeta('397')).toBe(undefined)
   expect(parseMeta('{broken')).toBe(undefined)
@@ -129,22 +131,25 @@ test('downloads exec yt-dlp into a pipe, so killing the child kills the download
   expect(argv[2]!.startsWith('exec yt-dlp ')).toBe(true)
   expect(argv[2]).toContain('-o - > "$2"')
   expect(argv.slice(3)).toEqual(['/t/i.json', '251-20', '/t/audio.pipe'])
+  // Short requests: a long one sits idle behind the real-time reader until YouTube drops it.
+  expect(argv[2]).toContain('--http-chunk-size 1M')
 })
 
 test('decodeSize keeps the video shape, ~270 tall, at most 480 wide, even', () => {
-  expect(decodeSize(16 / 9)).toEqual({ width: 480, height: 270 })
-  expect(decodeSize(854 / 480)).toEqual({ width: 480, height: 268 })
-  expect(decodeSize(9 / 16)).toEqual({ width: 150, height: 266 })
+  expect(decodeSize(16 / 9, 30)).toEqual({ width: 480, height: 270, fps: 30 })
+  expect(decodeSize(854 / 480, 30)).toEqual({ width: 480, height: 268, fps: 30 })
+  expect(decodeSize(9 / 16, 30)).toEqual({ width: 150, height: 266, fps: 30 })
   expect(decodeSize(NaN)).toEqual(decodeSize(16 / 9))
 })
 
 test('decoder: both pipes paced in real time, frames to one file, PCM to the sound pipe', () => {
-  const size = { width: 480, height: 270 }
+  const size = { width: 480, height: 270, fps: 15 }
   const split = decoderArgv('/t/v.pipe', '/t/a.pipe', size, '/t/frame.rgb', '/t/pcm.pipe')
   expect(split.filter(a => a === '-re')).toHaveLength(2)
   expect(split[split.lastIndexOf('-map') + 1]).toBe('1:a:0')
   expect(split.slice(-6)).toEqual(['-ar', '48000', '-ac', '2', '-f', 's16le', '-y', '/t/pcm.pipe'].slice(-6))
-  expect(split).toContain('fps=15,scale=480:270:flags=area')
+  // realtime spreads the decoder's bursts back out to the frame clock, so frames land evenly.
+  expect(split).toContain('fps=15,scale=480:270:flags=area,realtime')
   expect(split.some(a => a.startsWith('http'))).toBe(false) // yt-dlp fetches; ffmpeg never opens a link
   const muxed = decoderArgv('/t/v.pipe', undefined, size, '/t/frame.rgb', '/t/pcm.pipe')
   expect(muxed.filter(a => a === '-i')).toHaveLength(1)
@@ -173,9 +178,27 @@ test('clock formats seconds as m:ss or h:mm:ss', () => {
 })
 
 test('decoderArgv seeks each input only when starting past zero', () => {
-  const size = { width: 480, height: 270 }
+  const size = { width: 480, height: 270, fps: 15 }
   expect(decoderArgv('v', 'a', size, 'f', 'p')).not.toContain('-ss')
   const argv = decoderArgv('v', 'a', size, 'f', 'p', 42)
   expect(argv.filter(x => x === '-ss').length).toBe(2)
   expect(argv.slice(argv.indexOf('-ss'), argv.indexOf('-ss') + 5)).toEqual(['-ss', '42.0', '-re', '-i', 'v'])
+})
+
+test('syncFilter pads to play later and trims to play earlier', () => {
+  expect(syncFilter(0)).toEqual([])
+  expect(syncFilter(150)).toEqual(['-af', 'adelay=150:all=1'])
+  expect(syncFilter(-100)).toEqual(['-af', 'atrim=start=0.100,asetpts=PTS-STARTPTS'])
+  const argv = decoderArgv('v', 'a', { width: 480, height: 270, fps: 15 }, 'f', 'p', 0, 150)
+  expect(argv.slice(argv.indexOf('1:a:0') + 1, argv.indexOf('1:a:0') + 3)).toEqual(['-af', 'adelay=150:all=1'])
+})
+
+test('decodeSize plays at the source frame rate, halving above 30 so no frame is dropped unevenly', () => {
+  expect(decodeSize(16 / 9, 24).fps).toBe(24)
+  expect(decodeSize(16 / 9, 25).fps).toBe(25)
+  expect(decodeSize(16 / 9, 30).fps).toBe(30)
+  expect(decodeSize(16 / 9, 60).fps).toBe(30)
+  expect(decodeSize(16 / 9, 50).fps).toBe(25)
+  expect(decodeSize(16 / 9, 29.97).fps).toBe(29.97)
+  expect(decodeSize(16 / 9).fps).toBe(30)
 })

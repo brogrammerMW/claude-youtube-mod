@@ -3,7 +3,7 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 
 import type { Video } from '../types'
 import {
-  blankCells, cellBox, clock, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, FPS, linksIn,
+  blankCells, cellBox, clock, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, linksIn,
   lookupArgv, nextOverride, parseFormats, parseMeta, pickMode, rgbToBlocks, seekTarget, soundArgv, videoIdFrom,
 } from './player'
 import type { FrameSize, Formats, Meta, Override, PlayerMode, TermEnv } from './player'
@@ -25,6 +25,10 @@ const submits = atom({ plugin: 'youtube', key: 'submits' } as const, 0)
 const override = atom({ plugin: 'youtube', key: 'override' } as const, 'auto' as Override)
 const paused = atom({ plugin: 'youtube', key: 'paused' } as const, false)
 const SKIP_SECONDS = 10
+// Image terminals draw each frame a little late, so the sound can run ahead; blocks need none.
+// ponytail: one session-wide offset, nudged by hand; save it per terminal if the right value differs.
+const syncMs = atom({ plugin: 'youtube', key: 'syncMs' } as const, 0)
+const SYNC_STEP_MS = 50
 
 export function parseResults(stdout: string): Video[] {
   return stdout
@@ -105,12 +109,16 @@ type Run = {
   /** yt-dlp's saved details file and the chosen formats: what a new leg starts from. */
   info: string
   formats?: Formats
-  /** One leg = one set of children playing from `offset`. Pause and skips end it; play and skips start the next. */
+  /** One leg = one set of children playing from `offset`. Skips end it and start the next. */
   leg: number
   offset: number
   /** When the current leg's first frame showed: position = offset + time since. */
   startedAt?: number
+  /** Pause freezes the leg's decoder and sound player (SIGSTOP), so play continues at once. */
   paused: boolean
+  pausedAt: number
+  /** In the decoder's and the sound player's arguments, and unique to the leg: what pkill matches. */
+  pcmPipe?: string
   /** The current leg's frame file: a new name per leg, so an old leg's frame never counts as new. */
   framePath: string
   /** Downloads, decoder and sound player of the current leg, all ended when it ends. */
@@ -216,7 +224,7 @@ async function startPlayback($: Engine, v: Video) {
   const dir = `${tmp}/yt-pane-${Date.now().toString(36)}`
   const r: Run = {
     id, video: v, pageUrl: `https://www.youtube.com/watch?v=${v.id}`, mode: m, dir,
-    info: `${dir}/info.info.json`, leg: 0, offset: 0, paused: false,
+    info: `${dir}/info.info.json`, leg: 0, offset: 0, paused: false, pausedAt: 0,
     framePath: `${dir}/frame.rgb`, children: [], errors: {}, decoderAt: Date.now(),
     gotFrame: false, lastMtime: 0, generation: 0, denies: 0, busy: false,
   }
@@ -243,9 +251,9 @@ async function startPlayback($: Engine, v: Video) {
     const formats = details.exitCode === 0 ? parseFormats(details.stdout) : undefined
     if (!formats) return failInPane($, r, lastLine(details.stderr) || 'no playable format')
     r.meta = parseMeta(details.stdout)
-    r.size = decodeSize(r.meta ? r.meta.width / r.meta.height : 16 / 9)
+    r.size = decodeSize(r.meta ? r.meta.width / r.meta.height : 16 / 9, r.meta?.fps)
     r.formats = formats
-    await update($, status, () => `${m === 'pixels' ? 'pixels' : 'blocks'} · ${FPS} fps`)
+    await update($, status, () => `${m === 'pixels' ? 'pixels' : 'blocks'} · ${Math.round(r.size.fps)} fps`)
     await startLeg($, r, 0)
   } catch (err) {
     return failInPane($, r, String(err))
@@ -255,8 +263,15 @@ async function startPlayback($: Engine, v: Video) {
   r.ticker = $.clock.every(POLL_MS, () => void tick($, r))
 }
 
+// SIGSTOP / SIGCONT the leg's decoder and sound player. The downloads stall on the full pipes by themselves.
+async function signalLeg($: Engine, r: Run, sig: '-STOP' | '-CONT') {
+  if (r.pcmPipe) await $.process.run(['pkill', sig, '-f', r.pcmPipe]).catch(() => undefined)
+}
+
 // Ends the current leg: its children stop, and nothing they report afterwards counts.
-function endLeg(r: Run) {
+// A frozen leg is woken too, so the kill reaches it.
+function endLeg($: Engine, r: Run) {
+  if (r.paused) void signalLeg($, r, '-CONT')
   r.leg++
   // A silent child never wakes a read loop, so each handle is closed explicitly.
   for (const h of r.children) void h.return({ code: null, signal: null }).catch(() => undefined)
@@ -270,10 +285,11 @@ function endLeg(r: Run) {
 async function startLeg($: Engine, r: Run, at: number) {
   const f = r.formats
   if (!f || !r.size) return
-  endLeg(r)
+  endLeg($, r)
   const leg = r.leg
   Object.assign(r, { offset: at, startedAt: undefined, paused: false, gotFrame: false, lastMtime: 0, errors: {} })
   r.framePath = `${r.dir}/frame-${leg}.rgb`
+  r.pcmPipe = `${r.dir}/pcm-${leg}.pipe`
   const pipes = { video: `${r.dir}/video-${leg}.pipe`, audio: `${r.dir}/audio-${leg}.pipe`, pcm: `${r.dir}/pcm-${leg}.pipe` }
   const made = await $.process.run(['mkfifo', pipes.video, pipes.pcm, ...(f.muxed ? [] : [pipes.audio])])
   if (run?.id !== r.id || r.leg !== leg) return
@@ -282,11 +298,12 @@ async function startLeg($: Engine, r: Run, at: number) {
   void child($, r, 'video download', downloadArgv(r.info, f.video, pipes.video))
   if (!f.muxed) void child($, r, 'audio download', downloadArgv(r.info, f.audio, pipes.audio))
   r.decoderAt = Date.now()
-  void watchDecoder($, r, leg, decoderArgv(pipes.video, f.muxed ? undefined : pipes.audio, r.size, r.framePath, pipes.pcm, at))
+  const sync = await read($, syncMs)
+  void watchDecoder($, r, leg, decoderArgv(pipes.video, f.muxed ? undefined : pipes.audio, r.size, r.framePath, pipes.pcm, at, sync))
 }
 
 const position = (r: Run) =>
-  r.paused || r.startedAt === undefined ? r.offset : r.offset + (Date.now() - r.startedAt) / 1000
+  r.startedAt === undefined ? r.offset : r.offset + ((r.paused ? r.pausedAt : Date.now()) - r.startedAt) / 1000
 
 const total = (r: Run) => (r.meta?.seconds !== undefined ? ` / ${clock(r.meta.seconds)}` : '')
 
@@ -295,12 +312,16 @@ async function togglePause($: Engine) {
   if (!r?.formats) return
   if (r.paused) {
     await update($, paused, () => false)
-    await update($, status, () => `▶ ${clock(r.offset)}${total(r)}`)
-    return startLeg($, r, r.offset)
+    await update($, status, () => `▶ ${clock(position(r))}${total(r)}`)
+    // A skip while paused ended the leg: start one there. Otherwise wake the frozen one.
+    if (r.children.length === 0) return startLeg($, r, r.offset)
+    if (r.startedAt !== undefined) r.startedAt += Date.now() - r.pausedAt
+    r.paused = false
+    return signalLeg($, r, '-CONT')
   }
   const at = position(r)
-  endLeg(r)
-  Object.assign(r, { paused: true, offset: at })
+  Object.assign(r, { paused: true, pausedAt: Date.now() })
+  await signalLeg($, r, '-STOP')
   await update($, paused, () => true)
   await update($, status, () => `Paused at ${clock(at)}${total(r)}`)
 }
@@ -311,14 +332,28 @@ async function skip($: Engine, delta: number) {
   if (!r?.formats) return
   const at = seekTarget(position(r), delta, r.meta?.seconds)
   await update($, status, () => `${delta < 0 ? '◀◀' : '▶▶'} ${clock(at)}${total(r)}${r.paused ? ' · paused' : ''}`)
-  if (r.paused) r.offset = at
-  else await startLeg($, r, at)
+  if (!r.paused) return startLeg($, r, at)
+  endLeg($, r)
+  Object.assign(r, { offset: at, startedAt: undefined })
+}
+
+// Moves the sound against the picture and restarts from the current spot to apply it.
+async function nudgeSync($: Engine, deltaMs: number) {
+  const ms = (await read($, syncMs)) + deltaMs
+  await update($, syncMs, () => ms)
+  await update($, status, () => `audio ${ms > 0 ? '+' : ''}${ms} ms${ms > 0 ? ' (later)' : ms < 0 ? ' (earlier)' : ''}`)
+  const r = run
+  if (r?.formats && !r.paused) await startLeg($, r, position(r))
 }
 
 // The decoder's end is the leg's end: finished, or failed with the most telling error line.
 async function watchDecoder($: Engine, r: Run, leg: number, argv: string[]) {
   const code = await child($, r, 'decoder', argv)
   if (run?.id !== r.id || r.leg !== leg) return // stopped, paused or skipped by us: not a failure
+  // A long pause can let YouTube drop the stalled download, which ends the decoder early:
+  // pick up from there, once per leg that showed a picture (a failing restart shows none).
+  const at = position(r)
+  if (code === 0 && r.gotFrame && r.meta?.seconds !== undefined && at < r.meta.seconds - 5) return startLeg($, r, at)
   if (code === 0) return stopPlayback($, `Finished: ${r.video.title}`)
   const why = r.errors['video download'] ?? r.errors['audio download'] ?? r.errors.decoder ?? `ffmpeg exited ${code}`
   return failInPane($, r, why)
@@ -396,7 +431,7 @@ async function stopPlayback($: Engine, message?: string) {
   if (message) await update($, status, () => message)
   if (!r) return
   r.ticker?.cancel()
-  endLeg(r)
+  endLeg($, r)
   if (r.dir.includes('/yt-pane-')) void $.process.run(['rm', '-rf', r.dir]).catch(() => undefined)
 }
 
@@ -526,6 +561,8 @@ export const register: Register = on => {
             <Button key="back" plain label={`◀◀ ${SKIP_SECONDS}s`} {...(keys ? { hotkey: 'j' } : {})} onPress={() => void skip($, -SKIP_SECONDS)} />
             <Button key="pause" plain label={isPaused ? 'play' : 'pause'} {...(keys ? { hotkey: 'k' } : {})} onPress={() => void togglePause($)} />
             <Button key="forward" plain label={`${SKIP_SECONDS}s ▶▶`} {...(keys ? { hotkey: 'l' } : {})} onPress={() => void skip($, SKIP_SECONDS)} />
+            <Button key="sync-earlier" plain label="audio −" {...(keys ? { hotkey: 'a' } : {})} onPress={() => void nudgeSync($, -SYNC_STEP_MS)} />
+            <Button key="sync-later" plain label="audio +" {...(keys ? { hotkey: 'd' } : {})} onPress={() => void nudgeSync($, SYNC_STEP_MS)} />
             <Button key="stop" plain label="stop" {...(keys ? { hotkey: 's' } : {})} onPress={() => void stopPlayback($, 'Stopped.')} />
             <Button key="window" plain label="window" {...(keys ? { hotkey: 'm' } : {})}
               onPress={() => { const r = run; if (r) void fallbackToMpv($, r, 'window requested') }} />
