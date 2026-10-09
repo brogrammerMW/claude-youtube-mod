@@ -9,7 +9,8 @@ declare global {
 
 export type PlayerMode = 'pixels' | 'blocks'
 export type Override = PlayerMode | 'auto'
-export type FrameSize = { width: number; height: number }
+/** What ffmpeg decodes to: pixels and frames a second, fixed for the whole video. */
+export type FrameSize = { width: number; height: number; fps: number }
 export type TermEnv = { termProgram?: string; term?: string; kittyWindow?: string }
 
 const PIXEL_TERM_PROGRAMS = ['ghostty', 'wezterm']
@@ -51,7 +52,7 @@ const even = (n: number) => Math.max(2, Math.floor(n / 2) * 2)
 // decodes once at a fixed size, ffplay plays the sound. Named pipes join them.
 
 const FORMAT = 'bv*[height<=480]+ba/b[height<=480]/bv*+ba/b'
-export const FPS = 15
+const MAX_FPS = 30
 
 // Online, once: save yt-dlp's details file (`${base}.info.json`) for the steps below.
 export function lookupArgv(pageUrl: string, base: string): string[] {
@@ -63,7 +64,7 @@ export function detailsArgv(infoPath: string): string[] {
   return ['yt-dlp', '--no-warnings', '--load-info-json', infoPath, '-f', FORMAT,
     '--print', '%(requested_formats.0.format_id,format_id)s',
     '--print', '%(requested_formats.1.format_id,format_id)s',
-    '--print', '%(.{width,height,channel,view_count,like_count,upload_date,duration,duration_string,description})j']
+    '--print', '%(.{fps,width,height,channel,view_count,like_count,upload_date,duration,duration_string,description})j']
 }
 
 export type Formats = { video: string; audio: string; muxed: boolean }
@@ -84,13 +85,16 @@ export function downloadArgv(infoPath: string, formatId: string, pipe: string): 
 }
 
 // One decode size per video, in its own shape: about 270 px tall, at most 480 wide.
-export function decodeSize(aspect: number): FrameSize {
+// At the source's own frame rate, halved above 30: any other rate drops frames unevenly (judder).
+export function decodeSize(aspect: number, sourceFps?: number): FrameSize {
   const a = aspect > 0 && Number.isFinite(aspect) ? aspect : 16 / 9
   const width = Math.min(480, even(270 * a))
-  return { width, height: even(width / a) }
+  const src = sourceFps && sourceFps > 0 && Number.isFinite(sourceFps) ? sourceFps : MAX_FPS
+  return { width, height: even(width / a), fps: src > MAX_FPS ? src / 2 : src }
 }
 
-// ffmpeg paces both inputs in real time (-re): frames go to one overwritten raw rgb24 file,
+// ffmpeg paces both inputs in real time (-re), and realtime re-paces the decoded frames,
+// which the threaded decoder hands over in bursts: frames go to one overwritten raw rgb24 file,
 // sound goes as raw PCM into the pipe ffplay reads. One process, one clock.
 // startAt > 0 starts there: ffmpeg reads and drops what comes before at full speed, unpaced.
 // syncMs shifts the sound against the picture: later when positive, earlier when negative.
@@ -98,7 +102,7 @@ export function decoderArgv(videoPipe: string, audioPipe: string | undefined, si
   const ss = startAt > 0 ? ['-ss', startAt.toFixed(1)] : []
   return ['ffmpeg', '-v', 'error', '-nostdin',
     ...ss, '-re', '-i', videoPipe, ...(audioPipe ? [...ss, '-re', '-i', audioPipe] : []),
-    '-map', '0:v:0', '-vf', `fps=${FPS},scale=${size.width}:${size.height}:flags=area`,
+    '-map', '0:v:0', '-vf', `fps=${size.fps},scale=${size.width}:${size.height}:flags=area,realtime`,
     '-pix_fmt', 'rgb24', '-c:v', 'rawvideo', '-f', 'image2', '-update', '1', '-atomic_writing', '1', framePath,
     '-map', audioPipe ? '1:a:0' : '0:a:0', ...syncFilter(syncMs), '-ar', '48000', '-ac', '2', '-f', 's16le', '-y', pcmPipe]
 }
@@ -119,7 +123,7 @@ export function soundArgv(pcmPipe: string): string[] {
 }
 
 export type Meta = {
-  width: number; height: number; channel: string; views?: number; likes?: number
+  width: number; height: number; fps?: number; channel: string; views?: number; likes?: number
   date: string; duration: string; description: string
   /** Length in seconds; undefined for live streams. */
   seconds?: number
@@ -135,7 +139,7 @@ export function parseMeta(stdout: string): Meta | undefined {
     const str = (v: unknown) => (typeof v === 'string' ? v : '')
     const d = str(j.upload_date)
     return {
-      width: num(j.width) ?? 16, height: num(j.height) ?? 9, channel: str(j.channel),
+      fps: num(j.fps), width: num(j.width) ?? 16, height: num(j.height) ?? 9, channel: str(j.channel),
       views: num(j.view_count), likes: num(j.like_count),
       date: /^\d{8}$/.test(d) ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : '',
       duration: str(j.duration_string), description: str(j.description), seconds: num(j.duration),
@@ -193,7 +197,7 @@ const QUADRANTS = [
 
 // rgb is (cols*2) x (rows*2) pixels, 3 bytes each. For every cell, try each way of splitting its
 // four pixels into two groups, color each group by its mean, and keep the split with the least error.
-// ponytail: 8 splits x 4 pixels per cell; at 120x40 cells and 15 fps that is ~2.3M small steps a second.
+// ponytail: 8 splits x 4 pixels per cell; at 120x40 cells and 30 fps that is ~4.6M small steps a second; tick skips frames it cannot keep up with.
 const SPLITS = [15, 8, 9, 10, 11, 12, 13, 14]
 
 export function quadrantWords(rgb: Uint8Array, cols: number, rows: number): Uint32Array {

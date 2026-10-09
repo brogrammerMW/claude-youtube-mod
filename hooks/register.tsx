@@ -3,7 +3,7 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 
 import type { Video } from '../types'
 import {
-  blankCells, cellBox, clock, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, FPS, linksIn,
+  blankCells, cellBox, clock, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, linksIn,
   lookupArgv, nextOverride, parseFormats, parseMeta, pickMode, rgbToBlocks, seekTarget, soundArgv, videoIdFrom,
 } from './player'
 import type { FrameSize, Formats, Meta, Override, PlayerMode, TermEnv } from './player'
@@ -251,9 +251,9 @@ async function startPlayback($: Engine, v: Video) {
     const formats = details.exitCode === 0 ? parseFormats(details.stdout) : undefined
     if (!formats) return failInPane($, r, lastLine(details.stderr) || 'no playable format')
     r.meta = parseMeta(details.stdout)
-    r.size = decodeSize(r.meta ? r.meta.width / r.meta.height : 16 / 9)
+    r.size = decodeSize(r.meta ? r.meta.width / r.meta.height : 16 / 9, r.meta?.fps)
     r.formats = formats
-    await update($, status, () => `${m === 'pixels' ? 'pixels' : 'blocks'} · ${FPS} fps`)
+    await update($, status, () => `${m === 'pixels' ? 'pixels' : 'blocks'} · ${Math.round(r.size.fps)} fps`)
     await startLeg($, r, 0)
   } catch (err) {
     return failInPane($, r, String(err))
@@ -561,8 +561,8 @@ export const register: Register = on => {
             <Button key="back" plain label={`◀◀ ${SKIP_SECONDS}s`} {...(keys ? { hotkey: 'j' } : {})} onPress={() => void skip($, -SKIP_SECONDS)} />
             <Button key="pause" plain label={isPaused ? 'play' : 'pause'} {...(keys ? { hotkey: 'k' } : {})} onPress={() => void togglePause($)} />
             <Button key="forward" plain label={`${SKIP_SECONDS}s ▶▶`} {...(keys ? { hotkey: 'l' } : {})} onPress={() => void skip($, SKIP_SECONDS)} />
-            <Button key="sync-earlier" plain label="audio −" {...(keys ? { hotkey: '[' } : {})} onPress={() => void nudgeSync($, -SYNC_STEP_MS)} />
-            <Button key="sync-later" plain label="audio +" {...(keys ? { hotkey: ']' } : {})} onPress={() => void nudgeSync($, SYNC_STEP_MS)} />
+            <Button key="sync-earlier" plain label="audio −" {...(keys ? { hotkey: 'a' } : {})} onPress={() => void nudgeSync($, -SYNC_STEP_MS)} />
+            <Button key="sync-later" plain label="audio +" {...(keys ? { hotkey: 'd' } : {})} onPress={() => void nudgeSync($, SYNC_STEP_MS)} />
             <Button key="stop" plain label="stop" {...(keys ? { hotkey: 's' } : {})} onPress={() => void stopPlayback($, 'Stopped.')} />
             <Button key="window" plain label="window" {...(keys ? { hotkey: 'm' } : {})}
               onPress={() => { const r = run; if (r) void fallbackToMpv($, r, 'window requested') }} />
