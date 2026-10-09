@@ -3,10 +3,10 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 
 import type { Video } from '../types'
 import {
-  blankCells, cellBox, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, FPS, linksIn,
-  lookupArgv, nextOverride, parseFormats, parseMeta, pickMode, rgbToBlocks, soundArgv, videoIdFrom,
+  blankCells, cellBox, clock, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, FPS, linksIn,
+  lookupArgv, nextOverride, parseFormats, parseMeta, pickMode, rgbToBlocks, seekTarget, soundArgv, videoIdFrom,
 } from './player'
-import type { FrameSize, Meta, Override, PlayerMode, TermEnv } from './player'
+import type { FrameSize, Formats, Meta, Override, PlayerMode, TermEnv } from './player'
 
 const PANE = 'youtube'
 // Theme color names, so the pane follows the person's light, dark or color-blind theme.
@@ -23,6 +23,8 @@ const mode = atom({ plugin: 'youtube', key: 'mode' } as const, 'blocks' as Playe
 const hasDraft = atom({ plugin: 'youtube', key: 'hasDraft' } as const, false)
 const submits = atom({ plugin: 'youtube', key: 'submits' } as const, 0)
 const override = atom({ plugin: 'youtube', key: 'override' } as const, 'auto' as Override)
+const paused = atom({ plugin: 'youtube', key: 'paused' } as const, false)
+const SKIP_SECONDS = 10
 
 export function parseResults(stdout: string): Video[] {
   return stdout
@@ -100,8 +102,18 @@ type Run = {
   meta?: Meta
   /** The fixed size ffmpeg decodes at: the pane scales it, so resizing restarts nothing. */
   size?: FrameSize
+  /** yt-dlp's saved details file and the chosen formats: what a new leg starts from. */
+  info: string
+  formats?: Formats
+  /** One leg = one set of children playing from `offset`. Pause and skips end it; play and skips start the next. */
+  leg: number
+  offset: number
+  /** When the current leg's first frame showed: position = offset + time since. */
+  startedAt?: number
+  paused: boolean
+  /** The current leg's frame file: a new name per leg, so an old leg's frame never counts as new. */
   framePath: string
-  /** Downloads, decoder and sound player: every child this run started, all ended on stop. */
+  /** Downloads, decoder and sound player of the current leg, all ended when it ends. */
   children: Handle[]
   /** Last error lines per child, for the message when playback fails. */
   errors: Record<string, string>
@@ -147,6 +159,7 @@ const lastLine = (text: string) => text.trim().split('\n').pop() ?? ''
 async function child($: Engine, r: Run, name: string, argv: string[]): Promise<number | null> {
   const h = $.process.spawn({ argv })
   r.children.push(h)
+  const errors = r.errors // this leg's: an ended child must not blame the next leg
   let stderr = ''
   try {
     return await pump(h, (stream, text) => { if (stream === 'stderr') stderr = (stderr + text).slice(-1000) })
@@ -154,7 +167,7 @@ async function child($: Engine, r: Run, name: string, argv: string[]): Promise<n
     stderr = String(err)
     return -1
   } finally {
-    if (stderr.trim()) r.errors[name] = lastLine(stderr)
+    if (stderr.trim()) errors[name] = lastLine(stderr)
   }
 }
 
@@ -203,6 +216,7 @@ async function startPlayback($: Engine, v: Video) {
   const dir = `${tmp}/yt-pane-${Date.now().toString(36)}`
   const r: Run = {
     id, video: v, pageUrl: `https://www.youtube.com/watch?v=${v.id}`, mode: m, dir,
+    info: `${dir}/info.info.json`, leg: 0, offset: 0, paused: false,
     framePath: `${dir}/frame.rgb`, children: [], errors: {}, decoderAt: Date.now(),
     gotFrame: false, lastMtime: 0, generation: 0, denies: 0, busy: false,
   }
@@ -210,6 +224,7 @@ async function startPlayback($: Engine, v: Video) {
   const alive = () => run?.id === id
   await update($, mode, () => m)
   await update($, playing, () => v.title)
+  await update($, paused, () => false)
   await update($, status, () => `Looking up "${v.title}"…`)
   try {
     await $.fs.write(`${dir}/.keep`, '')
@@ -218,7 +233,7 @@ async function startPlayback($: Engine, v: Video) {
   }
 
   // 1. Online, once: yt-dlp saves the video's details file. 2. Offline: formats and details from it.
-  const info = `${dir}/info.info.json`
+  const info = r.info
   try {
     const looked = await $.process.run(lookupArgv(r.pageUrl, `${dir}/info`), { timeoutMs: 45_000 })
     if (!alive()) return
@@ -229,19 +244,9 @@ async function startPlayback($: Engine, v: Video) {
     if (!formats) return failInPane($, r, lastLine(details.stderr) || 'no playable format')
     r.meta = parseMeta(details.stdout)
     r.size = decodeSize(r.meta ? r.meta.width / r.meta.height : 16 / 9)
-
-    // 3. Named pipes: yt-dlp → video / audio → ffmpeg → frames + PCM → ffplay.
-    const pipes = { video: `${dir}/video.pipe`, audio: `${dir}/audio.pipe`, pcm: `${dir}/pcm.pipe` }
-    const made = await $.process.run(['mkfifo', pipes.video, pipes.pcm, ...(formats.muxed ? [] : [pipes.audio])])
-    if (!alive()) return
-    if (made.exitCode !== 0) return failInPane($, r, lastLine(made.stderr) || 'could not make the pipes')
-
+    r.formats = formats
     await update($, status, () => `${m === 'pixels' ? 'pixels' : 'blocks'} · ${FPS} fps`)
-    void child($, r, 'sound', soundArgv(pipes.pcm))
-    void child($, r, 'video download', downloadArgv(info, formats.video, pipes.video))
-    if (!formats.muxed) void child($, r, 'audio download', downloadArgv(info, formats.audio, pipes.audio))
-    r.decoderAt = Date.now()
-    void watchDecoder($, r, decoderArgv(pipes.video, formats.muxed ? undefined : pipes.audio, r.size, r.framePath, pipes.pcm))
+    await startLeg($, r, 0)
   } catch (err) {
     return failInPane($, r, String(err))
   }
@@ -250,10 +255,70 @@ async function startPlayback($: Engine, v: Video) {
   r.ticker = $.clock.every(POLL_MS, () => void tick($, r))
 }
 
-// The decoder's end is the run's end: finished, or failed with the most telling error line.
-async function watchDecoder($: Engine, r: Run, argv: string[]) {
+// Ends the current leg: its children stop, and nothing they report afterwards counts.
+function endLeg(r: Run) {
+  r.leg++
+  // A silent child never wakes a read loop, so each handle is closed explicitly.
+  for (const h of r.children) void h.return({ code: null, signal: null }).catch(() => undefined)
+  r.children = []
+}
+
+// Starts playing `at` seconds in, through new named pipes:
+// yt-dlp → video / audio → ffmpeg → frames + PCM → ffplay.
+// ponytail: each leg downloads from the start and ffmpeg drops what comes before `at`, so a far
+// skip waits for that much download; fine at 480p, byte-range seeking if long videos feel slow.
+async function startLeg($: Engine, r: Run, at: number) {
+  const f = r.formats
+  if (!f || !r.size) return
+  endLeg(r)
+  const leg = r.leg
+  Object.assign(r, { offset: at, startedAt: undefined, paused: false, gotFrame: false, lastMtime: 0, errors: {} })
+  r.framePath = `${r.dir}/frame-${leg}.rgb`
+  const pipes = { video: `${r.dir}/video-${leg}.pipe`, audio: `${r.dir}/audio-${leg}.pipe`, pcm: `${r.dir}/pcm-${leg}.pipe` }
+  const made = await $.process.run(['mkfifo', pipes.video, pipes.pcm, ...(f.muxed ? [] : [pipes.audio])])
+  if (run?.id !== r.id || r.leg !== leg) return
+  if (made.exitCode !== 0) return failInPane($, r, lastLine(made.stderr) || 'could not make the pipes')
+  void child($, r, 'sound', soundArgv(pipes.pcm))
+  void child($, r, 'video download', downloadArgv(r.info, f.video, pipes.video))
+  if (!f.muxed) void child($, r, 'audio download', downloadArgv(r.info, f.audio, pipes.audio))
+  r.decoderAt = Date.now()
+  void watchDecoder($, r, leg, decoderArgv(pipes.video, f.muxed ? undefined : pipes.audio, r.size, r.framePath, pipes.pcm, at))
+}
+
+const position = (r: Run) =>
+  r.paused || r.startedAt === undefined ? r.offset : r.offset + (Date.now() - r.startedAt) / 1000
+
+const total = (r: Run) => (r.meta?.seconds !== undefined ? ` / ${clock(r.meta.seconds)}` : '')
+
+async function togglePause($: Engine) {
+  const r = run
+  if (!r?.formats) return
+  if (r.paused) {
+    await update($, paused, () => false)
+    await update($, status, () => `▶ ${clock(r.offset)}${total(r)}`)
+    return startLeg($, r, r.offset)
+  }
+  const at = position(r)
+  endLeg(r)
+  Object.assign(r, { paused: true, offset: at })
+  await update($, paused, () => true)
+  await update($, status, () => `Paused at ${clock(at)}${total(r)}`)
+}
+
+// Skips while paused only move the spot play resumes from.
+async function skip($: Engine, delta: number) {
+  const r = run
+  if (!r?.formats) return
+  const at = seekTarget(position(r), delta, r.meta?.seconds)
+  await update($, status, () => `${delta < 0 ? '◀◀' : '▶▶'} ${clock(at)}${total(r)}${r.paused ? ' · paused' : ''}`)
+  if (r.paused) r.offset = at
+  else await startLeg($, r, at)
+}
+
+// The decoder's end is the leg's end: finished, or failed with the most telling error line.
+async function watchDecoder($: Engine, r: Run, leg: number, argv: string[]) {
   const code = await child($, r, 'decoder', argv)
-  if (run?.id !== r.id) return // stopped by us: not a failure
+  if (run?.id !== r.id || r.leg !== leg) return // stopped, paused or skipped by us: not a failure
   if (code === 0) return stopPlayback($, `Finished: ${r.video.title}`)
   const why = r.errors['video download'] ?? r.errors['audio download'] ?? r.errors.decoder ?? `ffmpeg exited ${code}`
   return failInPane($, r, why)
@@ -266,9 +331,10 @@ async function tick($: Engine, r: Run) {
     const stat = await $.fs.stat(r.framePath).catch(() => undefined)
     if (run?.id !== r.id) return
     if (!stat) {
-      if (!r.gotFrame && Date.now() - r.decoderAt > FIRST_FRAME_MS) await failInPane($, r, 'no picture after 20 s')
+      if (!r.paused && !r.gotFrame && Date.now() - r.decoderAt > FIRST_FRAME_MS) await failInPane($, r, 'no picture after 20 s')
       return
     }
+    r.startedAt ??= Date.now()
     const box = shown
     if (!box || box.mode !== r.mode || stat.mtimeMs === r.lastMtime) return
     r.lastMtime = stat.mtimeMs
@@ -326,12 +392,11 @@ async function stopPlayback($: Engine, message?: string) {
   run = undefined
   shown = undefined
   await update($, playing, () => '')
+  await update($, paused, () => false)
   if (message) await update($, status, () => message)
   if (!r) return
   r.ticker?.cancel()
-  // A silent child never wakes a read loop, so each handle is closed explicitly.
-  for (const h of r.children) void h.return({ code: null, signal: null }).catch(() => undefined)
-  r.children = []
+  endLeg(r)
   if (r.dir.includes('/yt-pane-')) void $.process.run(['rm', '-rf', r.dir]).catch(() => undefined)
 }
 
@@ -438,6 +503,7 @@ export const register: Register = on => {
       // Hotkeys only while the search bar is empty, so typing "stop" never stops the video.
       const keys = !(await read($, hasDraft))
       const bar = await read($, submits)
+      const isPaused = await read($, paused)
       const others = (await read($, results)).filter(v => v.id !== run!.video.id).slice(0, 8)
       return (
         <Box flexDirection="column">
@@ -457,6 +523,9 @@ export const register: Register = on => {
           <Text bold wrap="truncate-end">{title}</Text>
           <Text color={C.dim} wrap="truncate-end">{facts.join('  ·  ')}</Text>
           <Box gap={2}>
+            <Button key="back" plain label={`◀◀ ${SKIP_SECONDS}s`} {...(keys ? { hotkey: 'j' } : {})} onPress={() => void skip($, -SKIP_SECONDS)} />
+            <Button key="pause" plain label={isPaused ? 'play' : 'pause'} {...(keys ? { hotkey: 'k' } : {})} onPress={() => void togglePause($)} />
+            <Button key="forward" plain label={`${SKIP_SECONDS}s ▶▶`} {...(keys ? { hotkey: 'l' } : {})} onPress={() => void skip($, SKIP_SECONDS)} />
             <Button key="stop" plain label="stop" {...(keys ? { hotkey: 's' } : {})} onPress={() => void stopPlayback($, 'Stopped.')} />
             <Button key="window" plain label="window" {...(keys ? { hotkey: 'm' } : {})}
               onPress={() => { const r = run; if (r) void fallbackToMpv($, r, 'window requested') }} />

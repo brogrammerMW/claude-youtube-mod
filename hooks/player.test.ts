@@ -1,7 +1,7 @@
 import { test, expect } from 'claude-code/testing'
 import {
-  blankCells, cellBox, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, linksIn, lookupArgv,
-  nextOverride, parseFormats, parseMeta, pickMode, quadrantWords, resample, rgbToBlocks, soundArgv, videoIdFrom,
+  blankCells, cellBox, clock, compact, decodeSize, decoderArgv, detailsArgv, downloadArgv, fitBox, linksIn, lookupArgv,
+  nextOverride, parseFormats, parseMeta, pickMode, quadrantWords, resample, rgbToBlocks, seekTarget, soundArgv, videoIdFrom,
 } from './player'
 
 test('pickMode: image terminals get pixels, the rest blocks, override wins', () => {
@@ -93,9 +93,9 @@ test('fitBox fills width or height with no bars', () => {
 })
 
 test('parseMeta reads the details JSON line', () => {
-  const out = '397\n251-20\n{"width":854,"height":480,"channel":"Chase AI","view_count":123456,"upload_date":"20260930","duration_string":"9:11","description":"see https://a.b/c."}'
+  const out = '397\n251-20\n{"width":854,"height":480,"channel":"Chase AI","view_count":123456,"upload_date":"20260930","duration":551,"duration_string":"9:11","description":"see https://a.b/c."}'
   const m = parseMeta(out)!
-  expect([m.width, m.height, m.channel, m.views, m.date, m.duration]).toEqual([854, 480, 'Chase AI', 123456, '2026-09-30', '9:11'])
+  expect([m.width, m.height, m.channel, m.views, m.date, m.duration, m.seconds]).toEqual([854, 480, 'Chase AI', 123456, '2026-09-30', '9:11', 551])
   expect(parseMeta('397')).toBe(undefined)
   expect(parseMeta('{broken')).toBe(undefined)
 })
@@ -157,4 +157,25 @@ test('sound: ffplay reads raw PCM from the pipe with minimal buffering', () => {
   expect(argv).not.toContain('-nostdin') // ffplay rejects it
   expect(argv).toContain('nobuffer')
   expect(argv.slice(-7)).toEqual(['-f', 's16le', '-ar', '48000', '-ch_layout', 'stereo', '/t/pcm.pipe'])
+})
+
+test('seekTarget stays between the start and just short of the end', () => {
+  expect(seekTarget(30, 10, 600)).toBe(40)
+  expect(seekTarget(5, -10, 600)).toBe(0)
+  expect(seekTarget(595, 10, 600)).toBe(598)
+  expect(seekTarget(30, 10)).toBe(40)
+})
+
+test('clock formats seconds as m:ss or h:mm:ss', () => {
+  expect(clock(0)).toBe('0:00')
+  expect(clock(75.9)).toBe('1:15')
+  expect(clock(3725)).toBe('1:02:05')
+})
+
+test('decoderArgv seeks each input only when starting past zero', () => {
+  const size = { width: 480, height: 270 }
+  expect(decoderArgv('v', 'a', size, 'f', 'p')).not.toContain('-ss')
+  const argv = decoderArgv('v', 'a', size, 'f', 'p', 42)
+  expect(argv.filter(x => x === '-ss').length).toBe(2)
+  expect(argv.slice(argv.indexOf('-ss'), argv.indexOf('-ss') + 5)).toEqual(['-ss', '42.0', '-re', '-i', 'v'])
 })
